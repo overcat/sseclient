@@ -6,18 +6,22 @@ import warnings
 import six
 
 import requests
-
+from requests import RequestException
 
 # Technically, we should support streams that mix line endings.  This regex,
 # however, assumes that a system will provide consistent line endings.
+
+
 end_of_field = re.compile(r'\r\n\r\n|\r\r|\n\n')
 
+
 class SSEClient(object):
-    def __init__(self, url, last_id=None, retry=3000, session=None, chunk_size=1024, **kwargs):
+    def __init__(self, url, last_id=None, retry=3000, session=None, chunk_size=1024, connect_retry=0, **kwargs):
         self.url = url
         self.last_id = last_id
         self.retry = retry
         self.chunk_size = chunk_size
+        self.connect_retry = connect_retry  # if connect_retry == -1, then retry forever
 
         # Optional support for passing in a requests.Session()
         self.session = session
@@ -35,7 +39,6 @@ class SSEClient(object):
 
         # Keep data here as it streams in
         self.buf = u''
-
         self._connect()
 
     def _connect(self):
@@ -44,12 +47,22 @@ class SSEClient(object):
 
         # Use session if set.  Otherwise fall back to requests module.
         requester = self.session or requests
-        self.resp = requester.get(self.url, stream=True, **self.requests_kwargs)
-        self.resp_iterator = self.resp.iter_content(chunk_size=self.chunk_size)
 
         # TODO: Ensure we're handling redirects.  Might also stick the 'origin'
         # attribute on Events like the Javascript spec requires.
-        self.resp.raise_for_status()
+        retry_count = 0
+        while True:
+            try:
+                self.resp = requester.get(self.url, stream=True, **self.requests_kwargs)
+                self.resp_iterator = self.resp.iter_content(chunk_size=self.chunk_size)
+                self.resp.raise_for_status()
+                return
+            except RequestException:
+                if self.connect_retry != -1 and retry_count >= self.connect_retry:
+                    raise
+                retry_count += 1
+                warnings.warn('Connect failed, retry attempt {}'.format(retry_count))
+                time.sleep(self.retry / 1000.0)
 
     def _event_complete(self):
         return re.search(end_of_field, self.buf) is not None
@@ -99,7 +112,6 @@ class SSEClient(object):
 
 
 class Event(object):
-
     sse_line_pattern = re.compile('(?P<name>[^:]*):?( ?(?P<value>.*))?')
 
     def __init__(self, data='', event='message', id=None, retry=None):
